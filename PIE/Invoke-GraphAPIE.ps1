@@ -3,7 +3,7 @@
 <#
   #===================================================#
   # GraphAPIE - MS Graph Phishing Intelligence Engine #
-  # v4.0.G  --  June 2021                             #
+  # v4.2.G  --  January 2022                          #
   #===================================================#
 
 # Copyright 2021 LogRhythm Inc.   
@@ -70,7 +70,6 @@ $AccessSecret = '' #| ConvertTo-SecureString -AsPlainText -Force
 $SocMailbox = ""
 
 
-
 # ================================================================================
 #   Microsoft Graph API Setup and Token Request using Client Creds
 #  
@@ -107,13 +106,13 @@ $LogRhythmHost = ""
 
 # Case Tagging and User Assignment
 # Default value - modify to match your case tagging schema. Note "PIE" tag is used with the Case Management Dashboard.
-$LrCaseTags = ("PIE", "TAG2")
+$LrCaseTags = ("PIE")
 
 # Add as many users as you would like, separate them like so: "user1", "user2"...
-$LrCaseCollaborators = ("example, user")
+$LrCaseCollaborators = ("")
 
 # Playbook Assignment based on Playbook Name
-$LrCasePlaybook = ("Phishing", "SOC Playbook")
+$LrCasePlaybook = ("Phishing")
 
 # Enable LogRhythm log search
 $LrLogSearch = $true
@@ -147,6 +146,55 @@ $shodan = $true
 # ************************* DO NOT EDIT BELOW THIS LINE *************************
 # ================================================================================
 
+#Load dependencies required to parse emails removed by ZIP
+#Ref https://pscustomobject.github.io/powershell/howto/PowerShell-Parse-Eml-File/
+
+function Convert-EmlFile
+{
+<#
+    .SYNOPSIS
+        Function will parse an eml files.
+
+    .DESCRIPTION
+        Function will parse eml file and return a normalized object that can be used to extract infromation from the encoded file.
+
+    .PARAMETER EmlFileName
+        A string representing the eml file to parse.
+
+    .EXAMPLE
+        PS C:\> Convert-EmlFile -EmlFileName 'C:\Test\test.eml'
+
+    .OUTPUTS
+        System.Object
+#>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $EmlFileName
+    )
+
+    # Instantiate new ADODB Stream object
+    $adoStream = New-Object -ComObject 'ADODB.Stream'
+
+    # Open stream
+    $adoStream.Open()
+
+    # Load file
+    $adoStream.LoadFromFile($EmlFileName)
+
+    # Instantiate new CDO Message Object
+    $cdoMessageObject = New-Object -ComObject 'CDO.Message'
+
+    # Open object and pass stream
+    $cdoMessageObject.DataSource.OpenObject($adoStream, '_Stream')
+
+    return $cdoMessageObject
+
+    }
 # ================================================================================
 # Date, File, and Global Email Parsing
 # ================================================================================
@@ -158,6 +206,7 @@ $phishLog = "$pieFolder\logs\ongoing-phish-log.csv"
 $caseFolder = "$pieFolder\cases\"
 $tmpFolder = "$pieFolder\tmp\"
 $runLog = "$pieFolder\logs\pierun.txt"
+$phishingKeywords = Get-Content "$pieFolder\regex-swiftonsecurity.txt"
 
 $LogsOutputFolder = (Join-Path $pieFolder -ChildPath "logs")
 if (!(Test-Path $LogsOutputFolder)) {
@@ -203,7 +252,7 @@ $LRTVersion = $(Get-Module -name logrhythm.tools | Select-Object -ExpandProperty
 New-PIELogger -logSev "i" -Message "PIE Version: $PIEVersion" -LogFile $runLog -PassThru
 New-PIELogger -logSev "i" -Message "LogRhythm Tools Version: $LRTVersion" -LogFile $runLog -PassThru
 
-
+s
 $CaseOutputFolder = (Join-Path $pieFolder -ChildPath "cases")
 if (!(Test-Path $CaseOutputFolder)) {
     Try {
@@ -229,6 +278,7 @@ if (!(Test-Path $CaseTmpFolder)) {
 $interestingFiles = @('pdf', 'exe', 'zip', 'doc', 'docx', 'docm', 'xls', 'xlsx', 'xlsm', 'ppt', 'pptx', 'arj', 'jar', '7zip', 'tar', 'gz', 'html', 'htm', 'js', 'rpm', 'bat', 'cmd')
 $interestingFilesRegex = [string]::Join('|', $interestingFiles)
 $specialPattern = "[^\u0000-\u007F]"
+$imageext = ".png",".jpg",".gif"
 
 # ================================================================================
 # MEAT OF THE PIE
@@ -306,6 +356,10 @@ if (!$InboxCompleted) {
 $InboxSkipped = $GraphInboxFolderList.value | Where-Object {$_.DisplayName -eq 'SKIPPED'}
 $InboxSkipped = $InboxSkipped.id
 
+#TEMP Remove this
+New-PIELogger -logSev "s" -Message "Mail Count $InboxNewMail" -LogFile $runLog -PassThru
+New-PIELogger -logSev "s" -Message "$GraphInboxFolderContentList" -LogFile $runLog -PassThru
+
 
 # If the folder does not exist, create it.
 if (!$InboxSkipped) {
@@ -330,8 +384,12 @@ if ($InboxNewMail -eq 0) {
     New-PIELogger -logSev "i" -Message "No new reports detected" -LogFile $runLog -PassThru
 } else {
     New-PIELogger -logSev "i" -Message "New inbox items detected.  Proceeding to evaluate for PhishReports." -LogFile $runLog -PassThru
+
+    #Initially the email is only a potential phish (i.e. boolean 0)
+    $maliciousEmail = "false"
     
-    # Loop through each inbox item to identify PhishReports
+    ######################################################
+    # Loop through each inbox item to identify standard msg PhishReports
     foreach ($i in $InboxMailIDs) {
         $ValidSubmissionAttachment = $false
 
@@ -342,8 +400,128 @@ if ($InboxNewMail -eq 0) {
             $GraphAttachmentRequest = "https://graph.microsoft.com/v1.0/users/$SocMailbox/messages/$i/attachments"
             $GraphAttachments = (Invoke-RestMethod -Headers @{Authorization = "Bearer $($token)"} -Uri $GraphAttachmentRequest  -Method Get)
 
-            #Just grab attachments to emails that are attached email messages, i.e. the raw phish.
+            #Just grab attachments to emails that are attached email messages, i.e. the raw phish, using two ways - either file extension, or rfc822.
+            $attachmentid = $GraphAttachments.value | Where-Object {$_.name -match "\.msg$"}
+            if (!$attachmentid) {
             $attachmentid = $GraphAttachments.value | Where-Object {$_.contentType -eq "message/rfc822"}
+
+            }
+
+            ################################################
+            #Second attempt, if we can't get an .msg then try and grab .eml file
+
+            if (!$attachmentid) {
+            $attachmentid = $GraphAttachments.value | Where-Object {$_.name -match "\.eml$"}
+            $emlid = $GraphAttachments.value | Where-Object {$_.name -match "\.eml$"}
+            $emlid = $emlid.id
+
+            #Unzip logic
+            foreach ($eml in $emlid){
+                $EmlAttachmentScrapeRequest = "https://graph.microsoft.com/v1.0/users/$socMailbox/messages/$i/attachments/$eml/?`$expand=microsoft.graph.itemattachment/item"
+                $EmlAttachmentScrape = (Invoke-RestMethod -Headers @{Authorization = "Bearer $($token)"} -Uri $EmlAttachmentScrapeRequest  -Method Get)
+              
+              #Here is where we write the ZIP file and expand archive
+
+              $emlname = $EmlAttachmentScrape.name
+              $emlname = $emlname -replace '[\[\]\/\*\:\<\>\|"]'
+              $emlname = $tmpFolder + $emlname
+              $emlfile = [Convert]::FromBase64String($EmlAttachmentScrape.contentBytes)
+                [IO.File]::WriteAllBytes($emlname, $emlfile)
+
+              
+               try { 
+               
+               #Extract Basic Mail Metadata
+               $ReloadedUnzipped = Convert-EmlFile -EmlFileName $emlname
+
+               #Manually extract Email
+               $MimeAnalysis = Get-Content -LiteralPath $emlname
+
+               
+                }
+               catch { 
+               New-PIELogger -logSev "i" -Message "Failed to load $emlname - Terminating" -LogFile $runLog -PassThru 
+               $attachmentid = $null
+               }
+
+               #Here we start loading in the good stuff
+
+               #Set it as a zip file for further analysis
+               #JC this was reused code from ZIP analysis, need to review if we broke anything
+                             
+                
+                $from = $ReloadedUnzipped.From | Select-String -pattern '\<(?<email>\S+@[^\>]+)\>$'
+                $from = $from.Matches.groups.value[1]
+                #$ReloadedUnzipped.Subject
+                $fromdisplay = $ReloadedUnzipped.From | Select-String -pattern '"(?<email>[^"]+)"'
+                $fromdisplay = $fromdisplay.Matches.groups.value[1]
+
+
+            }
+            }
+
+            ##########################################
+            #Third attempt - try to use the ZIP file
+
+            if (!$attachmentid) {
+            $attachmentid = $GraphAttachments.value | Where-Object {$_.name -match "\.zip$"}
+            $zipid = $GraphAttachments.value | Where-Object {$_.name -match "\.zip$"}
+            $zipid = $zipid.id
+
+            #Unzip logic
+            foreach ($iz in $zipid){
+                $ZipAttachmentScrapeRequest = "https://graph.microsoft.com/v1.0/users/$socMailbox/messages/$i/attachments/$iz/?`$expand=microsoft.graph.itemattachment/item"
+                $ZipAttachmentScrape = (Invoke-RestMethod -Headers @{Authorization = "Bearer $($token)"} -Uri $ZipAttachmentScrapeRequest  -Method Get)
+              
+              #Here is where we write the ZIP file and expand archive
+
+              $zipname = $ZipAttachmentScrape.name
+              $zipname = $zipname -replace '[\[\]\/\*\:\<\>\|"]'
+              $zipname = $tmpFolder + $zipname
+              $zipfile = [Convert]::FromBase64String($ZipAttachmentScrape.contentBytes)
+                [IO.File]::WriteAllBytes($zipname, $zipfile)
+
+                Expand-Archive -Path $zipname -DestinationPath $tmpFolder -Force
+
+                #Now we start working with the unzipped file and load it in
+
+               $FileNames = Get-ChildItem $tmpFolder
+               $unzipname = $FileNames.name -match '\.eml$'
+               $unzipname = $tmpFolder + $unzipname
+
+               #$unzipname = $zipname -replace 'zip$','eml'
+               try { 
+               
+               #Extract Basic Mail Metadata
+               $ReloadedUnzipped = Convert-EmlFile -EmlFileName $unzipname
+               Start-Sleep -s 5
+
+               #Manually extract Email
+               $MimeAnalysis = Get-Content -LiteralPath $unzipname
+
+               
+                }
+               catch { 
+               New-PIELogger -logSev "i" -Message "Failed to load $UnzipName - Terminating" -LogFile $runLog -PassThru 
+               $attachmentid = $null
+               }
+
+               #Here we start loading in the good stuff
+
+               #Set it as a zip file for further analysis
+               $isazip = "yes"
+
+
+                $from = $ReloadedUnzipped.From | Select-String -pattern '\<(?<email>\S+@[^\>]+)\>$'
+                $from = $from.Matches.groups.value[1]
+                #$ReloadedUnzipped.Subject
+                $fromdisplay = $ReloadedUnzipped.From | Select-String -pattern '"(?<email>[^"]+)"'
+                $fromdisplay = $fromdisplay.Matches.groups.value[1]
+
+
+
+               }
+              }
             $attachmentidid = @($attachmentid.id)
 
             #Bomb out and move on if nothing attached.
@@ -355,6 +533,9 @@ if ($InboxNewMail -eq 0) {
 
             }
 
+            
+            #############################
+            #Now we have a good file loaded in from our phish report, lets take a look at it.
             #Continue if good
             else {
 
@@ -364,7 +545,7 @@ if ($InboxNewMail -eq 0) {
                 $GraphAttachmentScrape = (Invoke-RestMethod -Headers @{Authorization = "Bearer $($token)"} -Uri $GraphAttachmentScrapeRequest  -Method Get)
 
                 $ValidSubmissionAttachment = $true
-                }
+
 
 
         
@@ -493,6 +674,9 @@ if ($InboxNewMail -eq 0) {
         $ReportEvidence.Meta.Guid = $ReportGuid
 
         # Set ReportSubmission data
+
+      
+
         $ReportEvidence.ReportSubmission.Sender = $($NewReport.sender.emailAddress.address)
         $ReportEvidence.ReportSubmission.SenderDisplayName = $($NewReport.sender.emailAddress.name)
         $ReportEvidence.ReportSubmission.Recipient = $($NewReport.toRecipients.emailaddress.address)
@@ -500,13 +684,17 @@ if ($InboxNewMail -eq 0) {
         $ReportEvidence.ReportSubmission.UtcDate = $($NewReport.sentDateTime)#.ToString("yyyy-MM-ddTHHmmssffZ")
         $ReportEvidence.ReportSubmission.MessageId = $($NewReport.internetMessageId) -replace '(\<|\>)',''
 
+   
+
+        }
+
 
         # Track the user who reported the message
         New-PIELogger -logSev "i" -Message "Sent By: $($ReportEvidence.ReportSubmission.Sender)  Reported Subject: $($ReportEvidence.ReportSubmission.Subject.Original)" -LogFile $runLog -PassThru
         
 
         #This is the phisher's email address
-        $GraphAttachmentScrape.item.sender.emailAddress.address
+        #$GraphAttachmentScrape.item.sender.emailAddress.address
         
  
 #############################
@@ -520,17 +708,23 @@ if ($InboxNewMail -eq 0) {
             $GraphAttachmentMimeScrapeRequest = "https://graph.microsoft.com/v1.0/users/$SocMailbox/messages/$i/attachments/$ii/`$value" 
 
             $GraphAttachmentMimeScrape = (Invoke-RestMethod -Headers @{Authorization = "Bearer $($token)"} -Uri $GraphAttachmentMimeScrapeRequest  -Method Get)
-            $AttachmentDirectory = Join-Path -Path $tmpFolder -ChildPath $ReportEvidence.ReportSubmission.Subject.Original
-            $AttachmentOutputFile = $AttachmentDirectory + "-" + $ReportEvidence.ReportSubmission.MessageID + "_mime.txt"
+            $AttachmentSubDirectory = $ReportEvidence.ReportSubmission.Subject.Original -replace '[\[\]\/\*\:\<\>\|"]'
+            $AttachmentDirectory = Join-Path -Path $tmpFolder -ChildPath $AttachmentSubDirectory
+            $AttachmentOutputFile = $ReportEvidence.ReportSubmission.MessageID + "_mime.txt"
+            $AttachmentOutputFile = $AttachmentOutputFile -replace '[\[\]\/\*\:\<\>\|"]'
+            $AttachmentOutputFile = $AttachmentDirectory + "-" + $AttachmentOutputFile
             $GraphAttachmentMimeScrape | Out-File $AttachmentOutputFile
 
+            if (!$isazip)
+            {
             $MimeAnalysis = Get-Content $AttachmentOutputFile | Out-String
+            
 
             #Extract Content from MimeMesage
-            $EncodedAttachment = $MimeAnalysis | Select-String -pattern '(?msi)Content-Transfer-Encoding: base64..(?<msg>.*?).--_' -AllMatches
+            $EncodedAttachment = $MimeAnalysis | Select-String -pattern '(?msi)Content-Transfer-Encoding: base64..(?<msg>.*?).--(Apple-Mail=)?_' -AllMatches
 
             #Get Filenames
-            $attachmentSelect = $GraphAttachmentMimeScrape | select-string -pattern '(?msi)filename=\"(?<msg>[^\"]+)";' -AllMatches
+            $attachmentSelect = $GraphAttachmentMimeScrape | select-string -pattern '(?msi)filename=\"?(?<msg>[^\"\n]+)"?;?.' -AllMatches
 
             if ($EncodedAttachment) {
 
@@ -540,7 +734,8 @@ if ($InboxNewMail -eq 0) {
 
                  for ($ixx = 0; $ixx -lt $EncodedAttachment.Matches.Count; $ixx++) {
  
-                        $atb64 = $EncodedAttachment.Matches[$ixx].groups[1].value
+                        #$atb64 = $EncodedAttachment.Matches[$ixx].groups[1].value
+                        $atb64 = $EncodedAttachment.Matches[$ixx].Captures.Groups.Value[2]
 
                         $atname = $attachmentSelect.Matches[$ixx].Groups[1].value 
 
@@ -557,71 +752,185 @@ if ($InboxNewMail -eq 0) {
 
                 
                 $AttachCount = $attachmentsRaw.count
+
+                }
  
               }
-            }
+
+
+            if ($isazip) {
+            
+
+            $pattern = '(?msi)Content-Type: (?<type>\S+)\r\nContent-Transfer-Encoding: base64\r\nContent-Disposition: attachment;\sfilename="(?<filename>[^"]+)"\r\n(?<msg>.*?)\r\n\r\n--='
+            
+            $MimeAnalysis = $MimeAnalysis | Out-String
+            $ZipEmlattachmentSelect = $MimeAnalysis | select-string -pattern $pattern -AllMatches
+
+           
+            if ($ZipEmlattachmentSelect) {
+
+
+               $AttachmentsRaw = @()
+
+
+                 for ($izz = 0; $izz -lt $ZipEmlattachmentSelect.Matches.Count; $izz++) {
+ 
+                        $atb64 = $ZipEmlattachmentSelect.Matches[$izz].Groups["msg"].value
+
+                        $atname = $ZipEmlattachmentSelect.Matches[$izz].Groups["filename"].value
+
+                
+                $atname = $atname -replace "\r\n","" #Remove carriage returns from filenames.
+                $ReportEvidence.ReportSubmission.Attachment.Name = $atname 
+
+
+                $AttachmentsRaw += New-Object -TypeName psobject -Property @{Name=$atname; b64=$atb64}
+
+
+
+                  } 
+
+                
+                $AttachCount = $AttachmentsRaw.count
+ 
+              }
+
+
+                }
+            } 
+
+
+
 
         # Load e-mail from file
         $Eml = $GraphAttachmentMimeScrape
 
-        $ReportEvidence.EvaluationResults.Subject.Original = $ReportEvidence.ReportSubmission.Subject.Original
+        $ReportEvidence.EvaluationResults.Subject.Original = $ReloadedUnzipped.Subject
         if ($($ReportEvidence.EvaluationResults.Subject.Original) -Match "$specialPattern") {
             New-PIELogger -logSev "i" -Message "Creating Message Subject without Special Characters to support Case Note." -LogFile $runLog -PassThru
             $ReportEvidence.EvaluationResults.Subject.Modified = $ReportEvidence.EvaluationResults.Subject.Original -Replace "$specialPattern","?"
         }
         New-PIELogger -logSev "d" -Message "Message subject: $($ReportEvidence.EvaluationResults.Subject)" -LogFile $runLog -PassThru
         
-          
-        #Plain text Message Body
-        ##This regex reads the Mime body for content-type=text/plain or text/html and captures everything into capture group until the --_ delimter.
-        # Set ReportEvidence HTMLBody Content
-            $MimeBody = $GraphAttachmentMimeScrape | Select-String -pattern "(?msi)Content-Type: text\/(html)(?<bodyoutput>.*?)--_"
-            $MimeBodyPlain = $GraphAttachmentMimeScrape | Select-String -pattern "(?msi)Content-Type: text\/(plain)(?<bodyoutput>.*?)--_"
-            #$ReportEvidence.EvaluationResults.Body.Original = $MimeBody.Matches.groups[2].Value
+ 
+ #Plain text message processing         
+ if (!$isazip) {
 
-            $ReportEvidence.EvaluationResults.Body.Original = $GraphAttachmentScrape.item.body.content
+ New-PIELogger -logSev "s" -Message "Begin MSG format message processing logic" -LogFile $runLog -PassThru         
 
-        #Parse the Body to make it readable
-            #This removes the '=' EOL message and new lines from 	URLs, which would otherwise cause URL parsing issues.
-            $ReportEvidence.EvaluationResults.Body.Original = $ReportEvidence.EvaluationResults.Body.Original -replace "(?msi)=\r\n",""
+                #Plain text Message Body
+                ##This regex reads the Mime body for content-type=text/plain or text/html and captures everything into capture group until the --_ delimter.
+                # Set ReportEvidence HTMLBody Content
+                    $MimeBody = $GraphAttachmentMimeScrape | Select-String -pattern "(?msi)Content-Type: text\/(html)(?<bodyoutput>.*?)--_"
+                    $MimeBodyPlain = $GraphAttachmentMimeScrape | Select-String -pattern "(?msi)Content-Type: text\/(plain)(?<bodyoutput>.*?)--_"
 
-            #This transformation removes an extrenaus "3D" character from URL's causing formatting issues
-            $ReportEvidence.EvaluationResults.Body.Original = $ReportEvidence.EvaluationResults.Body.Original -replace "(?msi)=3Dhttp","=http"
+                    $ReportEvidence.EvaluationResults.Body.Original = $GraphAttachmentScrape.item.body.content
 
-        if ($($ReportEvidence.EvaluationResults.Body.Original) -Match "$specialPattern") {
-            New-PIELogger -logSev "i" -Message "Creating Message Body without Special Characters to support Case Note." -LogFile $runLog -PassThru
-            $ReportEvidence.EvaluationResults.Body.Modified = $ReportEvidence.EvaluationResults.Body.Original -Replace "$specialPattern","?"
-        }                     
+                #Parse the Body to make it readable
+                    #This removes the '=' EOL message and new lines from 	URLs, which would otherwise cause URL parsing issues.
+                    $ReportEvidence.EvaluationResults.Body.Original = $ReportEvidence.EvaluationResults.Body.Original -replace "(?msi)=\r\n",""
 
-        #Headers
-        New-PIELogger -logSev "d" -Message "Processing Headers" -LogFile $runLog -PassThru
-        #This line gets all data before content-type to get message headers
-        $ReportEvidence.EvaluationResults.Headers.Source = $GraphAttachmentScrape.item.internetMessageHeaders
-        #Rename 'name' array header to 'field', for presentation to invoke-pieheaderinspect
-        $ReportEvidence.EvaluationResults.Headers.Source = $ReportEvidence.EvaluationResults.Headers.Source | select @{n='field';e={$_.name}},value
-        Try {
-            New-PIELogger -logSev "i" -Message "Parsing Header Details" -LogFile $runLog -PassThru
-            $ReportEvidence.EvaluationResults.Headers.Details = Invoke-PieHeaderInspect -Headers $ReportEvidence.EvaluationResults.Headers.Source
-        } Catch {
-            New-PIELogger -logSev "e" -Message "Parsing Header Details" -LogFile $runLog -PassThru
+                    #This transformation removes an extrenaus "3D" character from URL's causing formatting issues
+                    $ReportEvidence.EvaluationResults.Body.Original = $ReportEvidence.EvaluationResults.Body.Original -replace "(?msi)=3Dhttp","=http"
+
+                if ($($ReportEvidence.EvaluationResults.Body.Original) -Match "$specialPattern") {
+                    New-PIELogger -logSev "i" -Message "Creating Message Body without Special Characters to support Case Note." -LogFile $runLog -PassThru
+                    $ReportEvidence.EvaluationResults.Body.Modified = $ReportEvidence.EvaluationResults.Body.Original -Replace "$specialPattern","?"
+                }                     
+
+                #Headers
+                New-PIELogger -logSev "d" -Message "Processing Headers" -LogFile $runLog -PassThru
+                #This line gets all data before content-type to get message headers
+                $ReportEvidence.EvaluationResults.Headers.Source = $GraphAttachmentScrape.item.internetMessageHeaders
+                #Rename 'name' array header to 'field', for presentation to invoke-pieheaderinspect
+                $ReportEvidence.EvaluationResults.Headers.Source = $ReportEvidence.EvaluationResults.Headers.Source | select @{n='field';e={$_.name}},value
+                Try {
+                    New-PIELogger -logSev "i" -Message "Parsing Header Details" -LogFile $runLog -PassThru
+                    $ReportEvidence.EvaluationResults.Headers.Details = Invoke-PieHeaderInspect -Headers $ReportEvidence.EvaluationResults.Headers.Source
+                } Catch {
+                    New-PIELogger -logSev "e" -Message "Parsing Header Details" -LogFile $runLog -PassThru
+                }
+
+                New-PIELogger -logSev "s" -Message "Begin Parsing URLs" -LogFile $runLog -PassThru                  
+                #Check if HTML Body exists else populate links from Text Body
+                New-PIELogger -logSev "i" -Message "Identifying URLs" -LogFile $runLog -PassThru
+                    
+                if ( $($GraphAttachmentScrape.item.body.content -like "*<html>*") ) { 
+
+                $ReportEvidence.EvaluationResults.HTMLBody.Original = $GraphAttachmentScrape.item.body.content
+
+                    New-PIELogger -logSev "d" -Message "Processing MIME to raw HTML" -LogFile $runLog -PassThru
+
+                     # Pull URL data from HTMLBody Content
+                    New-PIELogger -logSev "d" -Message "Processing URLs from message HTML body" -LogFile $runLog -PassThru
+                    #This is where we scrape links
+                    $HTML = New-Object -ComObject "HTMLFile"
+                    $HTML.IHTMLDocument2_write($ReportEvidence.EvaluationResults.Body.Original)
+                    $HTMLLinks = $HTML.links | % href
+            }
+
+
         }
 
-        New-PIELogger -logSev "s" -Message "Begin Parsing URLs" -LogFile $runLog -PassThru                  
-        #Check if HTML Body exists else populate links from Text Body
-        New-PIELogger -logSev "i" -Message "Identifying URLs" -LogFile $runLog -PassThru
+
+  #ZIPPED message processing    
+
+  if ($isazip) {
+
+            New-PIELogger -logSev "s" -Message "Beginning ZIP file message processing logic" -LogFile $runLog -PassThru         
+
+
+                    $ReportEvidence.EvaluationResults.Body.Original = $ReloadedUnzipped.HTMLBody
+                    $ReportEvidence.EvaluationResults.Recipient 
+                    $ReportEvidence.EvaluationResults.UtcDate = $ReloadedUnzipped.ReceivedTime
+                    $ReportEvidence.EvaluationResults.HTMLBody
+
+
+             
+
+                if ($($ReportEvidence.EvaluationResults.Body.Original) -Match "$specialPattern") {
+                    New-PIELogger -logSev "i" -Message "Creating Message Body without Special Characters to support Case Note." -LogFile $runLog -PassThru
+                    $ReportEvidence.EvaluationResults.Body.Modified = $ReportEvidence.EvaluationResults.Body.Original -Replace "$specialPattern","?"
+                }                     
+
+                #Headers
+                New-PIELogger -logSev "d" -Message "Processing Headers" -LogFile $runLog -PassThru
+                #This line gets all data before content-type to get message headers, load it back in to turn it into a single value
+                $MimeAnalysis = Out-String -InputObject $MimeAnalysis
+                $ZIPHeaders = $MimeAnalysis | Select-String -Pattern '(?msi)^(?<capture>.*?)Mime-Version: \d'
+
+                
+
+                $ReportEvidence.EvaluationResults.Headers.Source.value = $ZIPHeaders.Matches[0].Value
+
+                ##JC this doesn't work yet #Rename 'name' array header to 'field', for presentation to invoke-pieheaderinspect
+                $ReportEvidence.EvaluationResults.Headers.Source = $ReportEvidence.EvaluationResults.Headers.Source | select @{n='field';e={$_.name}},value
+                Try {
+                    New-PIELogger -logSev "i" -Message "Parsing Header Details" -LogFile $runLog -PassThru
+                    $ReportEvidence.EvaluationResults.Headers.Details = Invoke-PieHeaderInspect -Headers $ReportEvidence.EvaluationResults.Headers.Source
+                } Catch {
+                    New-PIELogger -logSev "e" -Message "Unable to parse Header Details" -LogFile $runLog -PassThru
+                }
+
+                New-PIELogger -logSev "s" -Message "Begin Parsing URLs" -LogFile $runLog -PassThru                  
+                #Check if HTML Body exists else populate links from Text Body
+                New-PIELogger -logSev "i" -Message "Identifying URLs" -LogFile $runLog -PassThru
                     
-        if ( $($GraphAttachmentScrape.item.body.content -like "*<html>*") ) { 
+                if ( $($GraphAttachmentScrape.item.body.content -like "*<html>*") ) { 
 
-        $ReportEvidence.EvaluationResults.HTMLBody.Original = $GraphAttachmentScrape.item.body.content
+                $ReportEvidence.EvaluationResults.HTMLBody.Original = $GraphAttachmentScrape.item.body.content
 
-            New-PIELogger -logSev "d" -Message "Processing MIME to raw HTML" -LogFile $runLog -PassThru
+                    New-PIELogger -logSev "d" -Message "Processing MIME to raw HTML" -LogFile $runLog -PassThru
 
-             # Pull URL data from HTMLBody Content
-            New-PIELogger -logSev "d" -Message "Processing URLs from message HTML body" -LogFile $runLog -PassThru
-            #This is where we scrape links
-            $HTML = New-Object -ComObject "HTMLFile"
-            $HTML.IHTMLDocument2_write($ReportEvidence.EvaluationResults.Body.Original)
-            $HTMLLinks = $HTML.links | % href
+                     # Pull URL data from HTMLBody Content
+                    New-PIELogger -logSev "d" -Message "Processing URLs from message HTML body" -LogFile $runLog -PassThru
+                    #This is where we scrape links
+                    $HTML = New-Object -ComObject "HTMLFile"
+                    $HTML.IHTMLDocument2_write($ReportEvidence.EvaluationResults.Body.Original)
+                    $HTMLLinks = $HTML.links | % href
+} 
+
+         }
 
 
             #Here we sanitise links we have scraped
@@ -629,7 +938,6 @@ if ($InboxNewMail -eq 0) {
             #Declare array
             $formatlink = @()
 
-            #JC this may be obscolescent
             foreach ($iiii in $HTMLLinks){
           
             if ( $iiii -like "*safelinks.protection.outlook.com*" ) {
@@ -647,9 +955,17 @@ if ($InboxNewMail -eq 0) {
                 }
                      }
 
+            
+            #Only include links that start with HTTP and remove duplicates.
+            $formatlink  = $formatlink  -match "^http"
+            $formatlink  = $formatlink  | Select-Object -Unique
+
+
  
-            $ReportEvidence.EvaluationResults.Links.Source = "HTML" }
+            $ReportEvidence.EvaluationResults.Links.Source = "HTML" #}
             #$ReportEvidence.EvaluationResults.Links.Value = $formatlink
+ 
+
 
             # Create copy of HTMLBody with special characters removed.
             if ($($ReportEvidence.EvaluationResults.Body.Original) -Match "$specialPattern") {
@@ -659,10 +975,13 @@ if ($InboxNewMail -eq 0) {
         } #else {
             New-PIELogger -logSev "a" -Message "Processing URLs from Message body" -LogFile $runLog -PassThru
             $ReportEvidence.EvaluationResults.Links.Source = "HTML"
-            $ReportEvidence.EvaluationResults.Links.Value = $(Get-PIEURLsFromHtml -HtmlSource $($ReportEvidence.EvaluationResults.Body.Original))
+
+            #Extract unwanted file extensions and deduplicate
+            $ReportEvidence.EvaluationResults.Links.Value = $(Get-PIEURLsFromHtml -HtmlSource $($ReportEvidence.EvaluationResults.Body.Original)) | Where-Object {$_.extension -notin $imageext}
+            $ReportEvidence.EvaluationResults.Links.Value = $ReportEvidence.EvaluationResults.Links.Value | Sort-Object -Property url -Unique
    
         #} 
-        New-PIELogger -logSev "s" -Message "End Parsing URLs" -LogFile $runLog -PassThru
+        New-PIELogger -logSev "s" -Message "End Parsing URLs - Total Count $ReportEvidence.EvaluationResults.Links.Value.Count" -LogFile $runLog -PassThru
 
         New-PIELogger -logSev "s" -Message "Begin Attachment block" -LogFile $runLog -PassThru
         New-PIELogger -logSev "i" -Message "Attachment Count: $($AttachCount)" -LogFile $runLog -PassThru
@@ -746,7 +1065,16 @@ if ($InboxNewMail -eq 0) {
             $ReportEvidence.EvaluationResults.Attachments = $Attachments
         }
 
+        #Load in sender metadata - if the value does not exist using standard msg graphattachmentscrape then get it using the unzipped technique
+        
         $ReportEvidence.EvaluationResults.Sender = $GraphAttachmentScrape.item.sender.emailAddress.address
+        if (!$ReportEvidence.EvaluationResults.Sender)
+         { $ReportEvidence.EvaluationResults.Sender = $from }
+
+        $ReportEvidence.EvaluationResults.SenderDisplayName = $GraphAttachmentScrape.item.sender.emailAddress.name
+        if (!$ReportEvidence.EvaluationResults.SenderDisplayName)
+         { $ReportEvidence.EvaluationResults.SenderDisplayName = $fromdisplay }
+
         New-PIELogger -logSev "i" -Message "Origin sender set to: $($ReportEvidence.EvaluationResults.Sender )" -LogFile $runLog -PassThru
         if ($LrTrueId) {
             New-PIELogger -logSev "s" -Message "LogRhythm API - Begin TrueIdentity Lookup" -LogFile $runLog -PassThru
@@ -766,7 +1094,7 @@ if ($InboxNewMail -eq 0) {
             New-PIELogger -logSev "s" -Message "LogRhythm API - End TrueIdentity Lookup" -LogFile $runLog -PassThru
         }
         
-        $ReportEvidence.EvaluationResults.SenderDisplayName = $GraphAttachmentScrape.item.sender.emailAddress.name
+
         if ($Eml.To.count -ge 1 -or $Eml.To.Length -ge 1) {
             $ReportEvidence.EvaluationResults.Recipient.To = $GraphAttachmentScrape.item.toRecipients.emailAddress.address
         } else {
@@ -801,6 +1129,8 @@ if ($InboxNewMail -eq 0) {
                 } elseif ($VTResults.response_code -eq 1) {
                     # Response Code 1 = Result in dataset
                     New-PIELogger -logSev "i" -Message "VirusTotal - Result in dataset." -LogFile $runLog -PassThru
+                    $maliciousEmail = "true"
+
                     $VTResponse = [PSCustomObject]@{
                         Status = $true
                         Note = $VTResults.verbose_msg
@@ -853,16 +1183,23 @@ if ($InboxNewMail -eq 0) {
                     $repl = $ReportEvidence.EvaluationResults.Links.Value -replace 'https?:\/\/',''
                     $DomainGroups = $repl -replace '\/.*$',''
                 $UniqueDomainValues = $DomainGroups | Sort-Object | Get-Unique
-                #$UniqueDomains = $UniqueDomainValues.count
+                #Hygiene for ZIP files
+                $UniqueDomainValues -replace '^.*=',''
 
-                New-PIELogger -logSev "i" -Message "Links: $($EmailUrls.count) Domains: $UniqueDomains" -LogFile $runLog -PassThru
+                New-PIELogger -logSev "i" -Message "Links: $($EmailUrls.count) Domains: $($UniqueDomainValues.Count)" -LogFile $runLog -PassThru
                 ForEach ($UniqueDomains in $UniqueDomainValues) {  
-                    New-PIELogger -logSev "i" -Message "Domain: $($UniqueDomains.Name) URLs: $($UniqueDomains.Count)" -LogFile $runLog -PassThru
-                    if ($UniqueDomains.count -ge 2) {
+                    #New-PIELogger -logSev "i" -Message "Domain: $($UniqueDomains.Name) URLs: $($UniqueDomains.Count)" -LogFile $runLog -PassThru
+                    if ($UniqueDomainValues.count -ge 2) {
                         # Collect details for initial
-                        $ScanTarget = $EmailUrls | Where-Object -Property hostname -like $UniqueDomains.Name | Select-Object -ExpandProperty Url -First 1
+                        #$ScanTarget = $EmailUrls | Where-Object -Property hostname -like $UniqueDomains.Name | Select-Object -ExpandProperty Url -First 1
+                        $ScanTarget = $EmailUrls |  Select-Object -ExpandProperty Url -First 1
                         New-PIELogger -logSev "i" -Message "Retrieve Domain Details - Url: $ScanTarget" -LogFile $runLog -PassThru
                         $DetailResults = Get-PIEUrlDetails -Url $ScanTarget -EnablePlugins -VTDomainScan
+
+                       if ($DetailResults.Plugins.VirusTotal.detected_urls.count > 0)
+
+                             { $maliciousEmail = "true" }
+
                         if ($UrlDetails -NotContains $DetailResults) {
                             $UrlDetails.Add($DetailResults)
                         }
@@ -870,21 +1207,18 @@ if ($InboxNewMail -eq 0) {
                         # Provide summary but skip plugin output for remainder URLs - Here is where we submit to VirusTotal etc.
                         $SummaryLinks = $EmailUrls
                         ForEach ($SummaryLink in $SummaryLinks) {
-                            $DetailResults = Get-PIEUrlDetails -Url $SummaryLink
+                            $DetailResults = Get-PIEUrlDetails -Url $SummaryLink#.URL
                             if ($UrlDetails -NotContains $DetailResults) {
                                 $UrlDetails.Add($DetailResults)
+
                             }
                         }
                     } else {
                         $ScanTargets = $EmailUrls | Where-Object {$_.Type -like "URL"}
+                        #Remove anomalous links
+                        $EmailUrls = $EmailUrls | Where-Object {$_.url -match "http"}
                         ForEach ($ScanTarget in $ScanTargets) {
 
-                        #Remove safelink.protection.outlook.com headers ##jc not required as this is handled within get-pieurldetails
-                        #if ($ScanTarget.url -like "*safelinks.protection.outlook.com*") {
-                        #    New-PIELogger -logSev "i" -Message "Removing safelink.protection.outlook.com headers" -LogFile $runLog -PassThru
-                         #   $xstriplink = $ScanTarget.url.Substring($ScanTarget.url.IndexOf('=') + 1)
-                        #    $ScanTarget.url = ([System.Web.HttpUtility]::UrlDecode($xstriplink)) }
-                        #
                             $ScanTarget = $ScanTarget.url
                           
 
@@ -895,12 +1229,6 @@ if ($InboxNewMail -eq 0) {
                             if ($UrlDetails -NotContains $DetailResults) {
                                 $UrlDetails.Add($DetailResults)
 
-#Domain Scan Attempt
-                                #$domain2scan = $DetailResults.Rewrite.After -replace 'https?:\/\/','' -replace '\/.*$',''
-                                #$DetailResults = Get-PIEUrlDetails -Url $domain2scan -EnablePlugins -VTDomainScan
-                                 #   if ($UrlDetails -NotContains $DetailResults) {
-                                 #       $UrlDetails.Add($DetailResults)
-                                 #   }
 
                             }
                         }
@@ -991,6 +1319,21 @@ if ($InboxNewMail -eq 0) {
             New-PIELogger -logSev "s" -Message "End - Link Summary from Attachments" -LogFile $runLog -PassThru
         }
         New-PIELogger -logSev "s" -Message "End - Link Summarization" -LogFile $runLog -PassThru
+
+        #Perform decisioning based upon SwiftonSecurity keywords
+
+
+            foreach($KeywordRegEx in $phishingKeywords)
+            {
+                if($ReportEvidence.EvaluationResults.Subject.Original -match $KeywordRegEx) 
+                {
+                
+                $maliciousEmail = "true"
+                New-PIELogger -logSev "i" -Message "Subject:  $phishsubject | Matches Keyword: $KeywordRegEx"  -LogFile $runLog -PassThru
+                
+                }
+            }
+
 
         # Create a case folder
         New-PIELogger -logSev "s" -Message "Creating Evidence Folder" -LogFile $runLog -PassThru
@@ -1098,11 +1441,25 @@ if ($InboxNewMail -eq 0) {
         if ($LrCaseOutput) {
             New-PIELogger -logSev "s" -Message "LogRhythm API - Create Case" -LogFile $runLog -PassThru
             if ( $ReportEvidence.EvaluationResults.Sender.Contains("@") -eq $true) {
-                New-PIELogger -logSev "d" -Message "LogRhythm API - Create Case with Sender Info" -LogFile $runLog -PassThru
-                $caseSummary = "Phishing email from $($ReportEvidence.EvaluationResults.Sender) was reported on $($ReportEvidence.ReportSubmission.UtcDate) UTC by $($ReportEvidence.ReportSubmission.Sender). The subject of the email is ($($GraphAttachmentScrape.item.subject))."
-                $CaseDetails = New-LrCase -Name "Phishing : $spammerName [at] $spammerDomain" -Priority 3 -Summary $caseSummary -PassThru
+
+            if ($maliciousEmail -eq "true" ) {
+
+                New-PIELogger -logSev "i" -Message "DECISION - Verified Phish - LogRhythm API - Create Case with Sender Info" -LogFile $runLog -PassThru
+                $caseSummary = "Verified phishing email from $($ReportEvidence.EvaluationResults.Sender) was reported on $($ReportEvidence.ReportSubmission.UtcDate) UTC by $($ReportEvidence.ReportSubmission.Sender). The subject of the email is ($($ReportEvidence.EvaluationResults.Subject.Original))."
+                $CaseDetails = New-LrCase -Name "Verified Phish : $spammerName [at] $spammerDomain" -Priority 2 -Summary $caseSummary -PassThru
+
+                }
+
+            if ($maliciousEmail -eq "false" ) {
+
+                New-PIELogger -logSev "i" -Message "DECISION - Possible Phish - LogRhythm API - Create Case with Sender Info" -LogFile $runLog -PassThru
+                $caseSummary = "Potential phishing email from $($ReportEvidence.EvaluationResults.Sender) was reported on $($ReportEvidence.ReportSubmission.UtcDate) UTC by $($ReportEvidence.ReportSubmission.Sender). The subject of the email is ($($ReportEvidence.EvaluationResults.Subject.Original))."
+                $CaseDetails = New-LrCase -Name "Potential Phish : $spammerName [at] $spammerDomain" -Priority 3 -Summary $caseSummary -PassThru
+
+                }
+
             } else {
-                New-PIELogger -logSev "d" -Message "LogRhythm API - Create Case without Sender Info" -LogFile $runLog -PassThru
+                New-PIELogger -logSev "i" -Message "NO DECISION - LogRhythm API - Create Case without Sender Info" -LogFile $runLog -PassThru
                 $caseSummary = "Phishing email was reported on $($ReportEvidence.ReportSubmission.UtcDate) UTC by $($ReportEvidence.ReportSubmission.Sender). The subject of the email is ($($ReportEvidence.EvaluationResults.Subject.Original))."
                 $CaseDetails = New-LrCase -Name "Phishing Message Reported" -Priority 3 -Summary $caseSummary -PassThru
                 
@@ -1130,7 +1487,8 @@ if ($InboxNewMail -eq 0) {
                 Update-LrCaseEarliestEvidence -Id $($ReportEvidence.LogRhythmCase.Number) -Timestamp $EvidenceTimestamp
             } else {
                 # Based on report submission for evaluation
-                [datetime] $EvidenceTimestamp = [datetime]::parseexact($ReportEvidence.ReportSubmission.UtcDate, "yyyy-MM-ddTHHmmssffZ", $null)
+                try { [datetime] $EvidenceTimestamp = [datetime]::parseexact($ReportEvidence.ReportSubmission.UtcDate, "yyyy-MM-ddTHHmmssffZ", $null) }
+                catch { $EvidenceTimestamp = [datetime]::parseexact($ReportEvidence.ReportSubmission.UtcDate, "yyyy-MM-ddTHH:mm:ssZ", $null) }
                 Update-LrCaseEarliestEvidence -Id $($ReportEvidence.LogRhythmCase.Number) -Timestamp $EvidenceTimestamp
             }
 
@@ -1388,12 +1746,13 @@ if ($InboxNewMail -eq 0) {
 
         New-PIELogger -logSev "i" -Message "Phish Log - Writing details to Phish Log." -LogFile $runLog -PassThru
         Try {
-            $PhishLogContent = "$($ReportEvidence.Meta.GUID),$($ReportEvidence.Meta.Timestamp),$($ReportEvidence.ReportSubmission.MessageId),$($ReportEvidence.EvaluationResults.Sender),$(cSender),$($ReportEvidence.ReportSubmission.Subject.Original)"
+            $PhishLogContent = "$($ReportEvidence.Meta.GUID),$($ReportEvidence.Meta.Timestamp),$($ReportEvidence.ReportSubmission.MessageId),$($ReportEvidence.EvaluationResults.Sender),$($ReportEvidence.ReportSubmission.Sender),$($ReportEvidence.ReportSubmission.Subject.Original)"
             $PhishLogContent | Out-File -FilePath $PhishLog -Append -Encoding ascii
         } Catch {
             New-PIELogger -logSev "e" -Message "Phish Log - Unable to write to $PhishLog" -LogFile $runLog -PassThru
-        }
-    }
+            echo $PhishLogContent
+        #}
+    #}
 
     #Cleanup Variables prior to next evaluation
     New-PIELogger -logSev "i" -Message "Resetting analysis varaiables" -LogFile $runLog -PassThru
@@ -1402,10 +1761,14 @@ if ($InboxNewMail -eq 0) {
     $attachment = $null
     $attachments = $null
     $caseID = $null
+    $maliciousEmail = $null
+    $isazip = $null
+    Clear-Variable Attach*
     New-PIELogger -logSev "i" -Message "End - Processing for GUID: $($ReportEvidence.Meta.Guid)" -LogFile $runLog -PassThru
 }
 }
-
+}
+}
 ##############################
 ##End of main detection loop##
 ##############################
